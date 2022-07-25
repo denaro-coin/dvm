@@ -1,8 +1,8 @@
 import inspect
 import json
 import zlib
-from decimal import Decimal
 from io import BytesIO
+from typing import Dict, List
 
 from denaro.constants import ENDIAN
 from timeout import timeout
@@ -11,7 +11,7 @@ from serializer import serialize, deserialize
 
 CURRENT_VERSION = b"dvm0\0"
 
-CONTRACT_METHOD_TIMEOUT = 0.0001
+CONTRACT_METHOD_TIMEOUT = 0.001
 
 
 class Address:
@@ -34,7 +34,8 @@ def _write_(obj):
 
 
 class ContractsCache:
-    contracts: dict = {}
+    # fixme
+    contracts: Dict[str, "Contract"] = {}
     contract_instances: list = []
     current_contract: "Contract" = None
 
@@ -46,21 +47,17 @@ class ContractsCache:
 
 
 class Contract:
-    _contract_hash = None
-    _variables = {}
-    _methods = {}
-    _private_methods = {}
-    _caller_contract: Address = None
-
     # todo rename sender?
     def __init__(self, contract_hash: str, variables: dict, methods: dict):
         self._contract_hash = contract_hash
         self._variables = variables
         self._methods = methods
+        self._private_methods = methods
+        self._caller_contract: Address = None
 
     # todo add params like no_contract, allowed_address or something?
     def export(self, func):
-        assert func.__name__ not in self._methods or func.__name__ not in self._private_methods
+        assert (func.__name__ not in self._methods) and (func.__name__ not in self._private_methods)
         if func.__code__.co_argcount != len(func.__annotations__):
             raise TypeError('Method types must be specified')
 
@@ -96,7 +93,7 @@ class Contract:
         return wrapper
 
     def private(self, func):
-        assert func.__name__ not in self._methods or func.__name__ not in self._private_methods
+        assert (func.__name__ not in self._methods) and (func.__name__ not in self._private_methods)
         if func.__code__.co_argcount != len(func.__annotations__):
             raise TypeError('Method types must be specified')
 
@@ -157,7 +154,9 @@ class ContractCall:
         self.args = args
 
     @staticmethod
-    def from_payload(payload: bytes):
+    def from_payload(payload: bytes | str):
+        if isinstance(payload, str):
+            payload = bytes.fromhex(payload)
         try:
             payload = zlib.decompress(payload)
         except zlib.error:
@@ -184,6 +183,32 @@ class ContractCall:
             [len(method_bytes)]) + method_bytes + args_bytes
 
 
+class ContractCallList:
+    def __init__(self, contract_calls: List[ContractCall]):
+        self.contract_calls = contract_calls
+
+    @staticmethod
+    def from_payload(payload: bytes | str):
+        if isinstance(payload, str):
+            payload = bytes.fromhex(payload)
+        try:
+            payload = zlib.decompress(payload)
+        except zlib.error:
+            pass
+        try:
+            return ContractCallList([ContractCall.from_payload(contract_call) for contract_call in deserialize(payload)])
+        except TypeError as e:
+            if str(e) != 'Invalid serialized type':
+                raise
+            return ContractCallList([ContractCall.from_payload(payload)])
+
+    def get_payload(self):
+        return serialize([contract_call.get_payload() for contract_call in self.contract_calls])
+
+    def __iter__(self):
+        return iter(self.contract_calls)
+
+
 class ContractCreation:
     def __init__(self, specifier: bytes, source_code: str, args: tuple = tuple()):
         self.specifier = specifier
@@ -203,11 +228,14 @@ class LimitedContract(Contract):
     def __init__(self, contract_hash: str):
         if contract_hash not in ContractsCache.contracts:
             raise NotImplementedError()
-        assert contract_hash not in ContractsCache.contract_instances
+        assert contract_hash not in ContractsCache.contract_instances, 'cannot call itself'
         ContractsCache.contract_instances.append(contract_hash)
         contract = ContractsCache.contracts[contract_hash]
         contract._caller_contract = Address(ContractsCache.current_contract._contract_hash)
         super().__init__(contract_hash, contract._variables, contract._methods)
 
     def export(self, func):
+        raise Exception('Cannot export')
+
+    def private(self, func):
         raise Exception('Cannot export')
