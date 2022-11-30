@@ -2,16 +2,13 @@ import inspect
 import json
 import zlib
 from io import BytesIO
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from denaro.constants import ENDIAN
-from timeout import timeout
-from serializer import serialize, deserialize
-
+from denaro.transactions import TransactionOutput
+from dvm.serializer import serialize, deserialize
 
 CURRENT_VERSION = b"dvm0\0"
-
-CONTRACT_METHOD_TIMEOUT = 0.001
 
 
 class Address:
@@ -25,19 +22,38 @@ class Address:
         return f"Address <{self.address}>"
 
 
-def _write_(obj):
-    if obj.__class__ == Contract:
-        return obj
-    if obj.__class__ == dict:
-        return obj
-    raise Exception(f'Cannot write to {obj.__class__.__name__}')
+class Event:
+    def __init__(self, *args, **kwargs):
+        args_names = self.construct.__code__.co_varnames[1:self.construct.__code__.co_argcount]
+        self._args = {**dict(zip(args_names, args)), **kwargs}
 
+    def construct(self, **kwargs):
+        ...
+
+    def to_dict(self):
+        return {'_': self.__class__.__name__} | self._args
+
+    def to_tuple(self):
+        return self.__class__.__name__, json.dumps({k: serialize(v).hex() for k, v in self._args.items()})
+
+
+class DVMTransaction:
+    def __init__(self, tx_hash: str, outputs: List[TransactionOutput]):
+        self.tx_hash = tx_hash
+        self.outputs = outputs
+        
 
 class ContractsCache:
     # fixme
     contracts: Dict[str, "Contract"] = {}
     contract_instances: list = []
-    current_contract: "Contract" = None
+    current_contract_hash: str = None
+
+    current_transaction: DVMTransaction = None
+    #current_block: Block = None
+
+    emitted_events: List[Tuple[str, Event]] = []
+    created_contracts: List[tuple] = []
 
     @staticmethod
     async def get(contract_hash):
@@ -47,24 +63,59 @@ class ContractsCache:
 
 
 class Contract:
+    deployed: "Contract" = None
+
     # todo rename sender?
-    def __init__(self, contract_hash: str, variables: dict, methods: dict):
+    def __init__(self, contract_hash: str, variables: dict, methods: dict = None):
         self._contract_hash = contract_hash
         self._variables = variables
-        self._methods = methods
-        self._private_methods = methods
-        self._caller_contract: Address = None
+        self._methods = methods or {}
+        self._caller_contract: Address
 
-    # todo add params like no_contract, allowed_address or something?
-    def export(self, func):
-        assert (func.__name__ not in self._methods) and (func.__name__ not in self._private_methods)
-        if func.__code__.co_argcount != len(func.__annotations__):
-            raise TypeError('Method types must be specified')
+        if not methods:
+            for name, func in inspect.getmembers(self, predicate=inspect.ismethod):
+                if not func.__qualname__.startswith(self.__class__.__name__):
+                    continue
+                if getattr(self.__class__, name):  # the check fails for inherited classes
+                    delattr(self.__class__, name)
+                self.wrap(func)
 
-        @timeout(CONTRACT_METHOD_TIMEOUT)
+    @staticmethod
+    def deploy(obj):
+        assert Contract.deployed is None, 'cannot deploy: already deployed'
+        assert issubclass(obj, Contract), 'cannot deploy: contract does not inherit main class'
+        Contract.deployed = obj
+        return obj
+
+    def reserved(self):
+        return {
+            'reserved': None,
+            'create': None,
+            'emit': None,
+            'deploy': None,
+            'wrap': None,
+
+            'address': self._contract_hash,
+            'transaction': ContractsCache.current_transaction,
+            #'block': ContractsCache.current_block
+        }
+
+    # todo
+    @classmethod
+    def create(cls, *args, **kwargs):
+        ContractsCache.created_contracts.append((ContractsCache.current_contract_hash, cls.__name__, CURRENT_VERSION, args, kwargs))
+
+    def emit(self, event: Event):
+        assert isinstance(event, Event), 'you can only emit instances of Event'
+        ContractsCache.emitted_events.append((self._contract_hash, event))
+
+    def wrap(self, func):
+        assert (func.__name__ not in self._methods)
+        if func.__code__.co_argcount - 1 > len(func.__annotations__):
+            raise TypeError(f'Method {func.__name__} types must be specified')
+
         def wrapper(*args, **kwargs):
-            ContractsCache.current_contract = self
-            func_args = inspect.getfullargspec(func).args
+            func_args = inspect.getfullargspec(func).args[1:]
             if func_args and func_args[0] == 'sender':
                 if args[0].__class__ != Address:
                     if self._caller_contract is not None:
@@ -77,57 +128,38 @@ class Contract:
             for i, arg in enumerate(args):
                 should_be = list(func.__annotations__.values())[i]
                 if type(arg) != should_be:
-                    raise TypeError(f'Parameter {i+1} of {func.__name__} method must be {should_be.__name__}, not {type(arg).__name__}')
+                    raise TypeError(f'Parameter {i + 1} of {func.__name__} method must be {should_be.__name__}, not {type(arg).__name__}')
             for i, (key, arg) in enumerate(kwargs.items()):
                 should_be = func.__annotations__[key]
-                if type(arg) != should_be:
-                    raise TypeError(f'Parameter {i+1} of {func.__name__} method must be {type(should_be).__name__}, not {type(arg).__name__}')
+                # fixme
+                from decimal import Decimal
+                if type(arg) is str and should_be is Decimal:
+                    kwargs[key] = Decimal(arg)
+                elif type(arg) is str and should_be is int:
+                    kwargs[key] = int(arg)
+                elif type(arg) != should_be:
+                    raise TypeError(f'Parameter {i + 1} of {func.__name__} method must be {should_be.__name__}, not {type(arg).__name__}')
 
             try:
-                return func(*args, **kwargs)
-            except Exception as e:
+                previous_contract = ContractsCache.current_contract_hash
+                ContractsCache.current_contract_hash = self._contract_hash
+                res = func(*args, **kwargs)
+                ContractsCache.current_contract_hash = previous_contract
+                return res
+            except Exception:
                 print('caught in ', self._contract_hash, args)
                 raise
-
         self._methods[func.__name__] = wrapper
-        return wrapper
-
-    def private(self, func):
-        assert (func.__name__ not in self._methods) and (func.__name__ not in self._private_methods)
-        if func.__code__.co_argcount != len(func.__annotations__):
-            raise TypeError('Method types must be specified')
-
-        @timeout(CONTRACT_METHOD_TIMEOUT)
-        def wrapper(*args, **kwargs):
-            for i, arg in enumerate(args):
-                should_be = list(func.__annotations__.values())[i]
-                if type(arg) != should_be:
-                    raise TypeError(f'Parameter {i+1} of {func.__name__} method must be {should_be.__name__}, not {type(arg).__name__}')
-            for i, (key, arg) in enumerate(kwargs.items()):
-                should_be = func.__annotations__[key]
-                if type(arg) != should_be:
-                    raise TypeError(f'Parameter {i+1} of {func.__name__} method must be {type(should_be).__name__}, not {type(arg).__name__}')
-
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                print(f'caught {str(e)}) in ', self._contract_hash, args)
-                raise
-
-        self._private_methods[func.__name__] = wrapper
-        return wrapper
 
     def __getattr__(self, key: str):
         if key[0] == '_':
             return super(Contract, self).__getattribute__(key)
-        if key == 'address':
-            return self._contract_hash
+        if key in self.reserved():
+            return self.reserved()[key]
         if key in self._variables:
             return self._variables[key]
         elif key in self._methods:
             return self._methods[key]
-        elif key in self._private_methods:
-            return self._private_methods[key]
         else:
             return super(Contract, self).__getattribute__(key)
 
@@ -135,8 +167,8 @@ class Contract:
         if key[0] == '_':
             super(Contract, self).__setattr__(key, value)
         else:
-            assert key not in self._methods
-            assert key != 'address'
+            assert key not in self._methods, f'overwriting {key} method'
+            assert key not in self.reserved(), 'overwriting reserved property'
             self._variables[key] = value
 
     def get_payload(self, method: str, args: tuple, specifier: bytes = CURRENT_VERSION):
@@ -183,8 +215,21 @@ class ContractCall:
             [len(method_bytes)]) + method_bytes + args_bytes
 
 
+class ContractCreation:
+    def __init__(self, specifier: bytes, source_code: str, args: tuple = tuple()):
+        self.specifier = specifier
+        self.source_code = source_code
+        self.args = args
+
+    def get_payload(self):
+        source_code_bytes = self.source_code.encode()
+        args_bytes = serialize(self.args)
+        payload = self.specifier + bytes([0]) + len(source_code_bytes).to_bytes(2, ENDIAN) + source_code_bytes + len(args_bytes).to_bytes(2, ENDIAN) + args_bytes
+        return zlib.compress(payload)
+
+
 class ContractCallList:
-    def __init__(self, contract_calls: List[ContractCall]):
+    def __init__(self, contract_calls: List[ContractCall | ContractCreation]):
         self.contract_calls = contract_calls
 
     @staticmethod
@@ -203,23 +248,7 @@ class ContractCallList:
             return ContractCallList([ContractCall.from_payload(payload)])
 
     def get_payload(self):
-        return serialize([contract_call.get_payload() for contract_call in self.contract_calls])
-
-    def __iter__(self):
-        return iter(self.contract_calls)
-
-
-class ContractCreation:
-    def __init__(self, specifier: bytes, source_code: str, args: tuple = tuple()):
-        self.specifier = specifier
-        self.source_code = source_code
-        self.args = args
-
-    def get_payload(self):
-        source_code_bytes = self.source_code.encode()
-        args_bytes = serialize(self.args)
-        payload = self.specifier + bytes([0]) + len(source_code_bytes).to_bytes(2, ENDIAN) + source_code_bytes + len(args_bytes).to_bytes(2, ENDIAN) + args_bytes
-        return zlib.compress(payload)
+        return zlib.compress(serialize([contract_call.get_payload() for contract_call in self.contract_calls]))
 
 
 class LimitedContract(Contract):
@@ -227,11 +256,11 @@ class LimitedContract(Contract):
 
     def __init__(self, contract_hash: str):
         if contract_hash not in ContractsCache.contracts:
-            raise NotImplementedError()
+            raise NotImplementedError(f'Contract <{contract_hash}> must be present in local contracts list')
         assert contract_hash not in ContractsCache.contract_instances, 'cannot call itself'
         ContractsCache.contract_instances.append(contract_hash)
         contract = ContractsCache.contracts[contract_hash]
-        contract._caller_contract = Address(ContractsCache.current_contract._contract_hash)
+        contract._caller_contract = Address(ContractsCache.current_contract_hash)
         super().__init__(contract_hash, contract._variables, contract._methods)
 
     def export(self, func):

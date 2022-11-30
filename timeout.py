@@ -29,25 +29,19 @@ except ImportError:
     import _thread as thread
 
 
-def timeout(s):
-    """
-    use as decorator to exit process if
-    function takes longer than s seconds
-    """
+class ContractTimeoutException(Exception):
+    ...
 
-    def outer(fn):
-        def inner(*args, **kwargs):
-            timer = threading.Timer(s, thread.interrupt_main)
-            timer.start()
-            try:
-                import time
-                t = time.time()
-                result = fn(*args, **kwargs)
-                print(time.time() - t)
-            finally:
-                timer.cancel()
-            return result
 
-        return inner
+def timeout_handler() -> None:
+    raise ContractTimeoutException()
 
-    return outer
+
+def timeout(s, func, *args, **kwargs):
+    timer = threading.Timer(s, thread.interrupt_main)
+    timer.start()
+    try:
+        result = func(*args, **kwargs)
+    finally:
+        timer.cancel()
+    return result

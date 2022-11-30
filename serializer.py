@@ -7,12 +7,12 @@ from enum import Enum, auto
 class Type(Enum):
     int = auto()
     str = auto()
+    bool = auto()
     bytes = auto()
     Decimal = auto()
     dict = auto()
     list = auto()
     tuple = auto()
-    bool = auto()  # fixme spostare bool piu in alto
 
     @classmethod
     def has_value(cls, value: int) -> bool:
@@ -22,24 +22,28 @@ class Type(Enum):
 _TYPE_TO_ENUM = {
     int: Type.int,
     str: Type.str,
+    bool: Type.bool,
     bytes: Type.bytes,
     Decimal: Type.Decimal,
     dict: Type.dict,
     list: Type.list,
     tuple: Type.tuple,
-    bool: Type.bool,  # fixme anche qua
 }
 
 _TYPE_BYTE_SIZE = 1  # uint8 (0 - 255)
 
 
-def type_to_bytes(value: int | str | float | dict | list | tuple):
+def type_to_bytes(value: int | str | bool | bytes | Decimal | dict | list | tuple):
     if type(value) not in _TYPE_TO_ENUM:
         raise TypeError(f"Type {type(value).__name__} for value {value!r} is unsupported")
     return _TYPE_TO_ENUM[type(value)].value.to_bytes(_TYPE_BYTE_SIZE, "little")
 
 
-def _serialize(to: io.BytesIO, value: int | str | float | dict | list | tuple):
+def remove_exponent(d: Decimal):
+    return d.quantize(Decimal(1)) if d == d.to_integral_value() else d.normalize()
+
+
+def _serialize(to: io.BytesIO, value: int | str | bool | bytes | Decimal | dict | list | tuple):
     to.write(type_to_bytes(value))
 
     match value:
@@ -54,21 +58,25 @@ def _serialize(to: io.BytesIO, value: int | str | float | dict | list | tuple):
             as_bytes = value.encode("utf-8")
 
             if len(as_bytes) > 2 ** 32 - 1:
-                raise ValueError(f"String length cannot be larger than (2 ** 32 - 1)")
+                raise ValueError(f"String length cannot be larger than {2 ** 32 - 1}")
 
             _serialize(to, len(as_bytes))
             to.write(as_bytes)
         case bytes():
             if len(value) > 2 ** 32 - 1:
-                raise ValueError(f"Bytes length cannot be larger than (2 ** 32 - 1)")
+                raise ValueError(f"Bytes length cannot be larger than {2 ** 32 - 1}")
 
             _serialize(to, len(value))
             to.write(value)
         case Decimal():
+            if value != +value:
+                raise ValueError("Decimal precision must be 28 or lower")
+            value = remove_exponent(value)
+
             as_bytes = str(value).encode("utf-8")
 
             if len(as_bytes) > 2 ** 32 - 1:
-                raise ValueError(f"Decimal string length cannot be larger than (2 ** 32 - 1)")
+                raise ValueError(f"Decimal string length cannot be larger than {2 ** 32 - 1}")
 
             _serialize(to, len(as_bytes))
             to.write(as_bytes)
@@ -88,8 +96,6 @@ def _serialize(to: io.BytesIO, value: int | str | float | dict | list | tuple):
 def _deserialize(stream: io.BytesIO):
     t = int.from_bytes(stream.read(_TYPE_BYTE_SIZE), "little")
     if not Type.has_value(t):
-        print(t)
-        print(stream.read().hex())
         raise TypeError("Invalid serialized type")
     match Type(t):
         case Type.int:
@@ -125,7 +131,6 @@ def _deserialize(stream: io.BytesIO):
 
 
 def deserialize(data: bytes):
-    #print('ah', data)
     return _deserialize(io.BytesIO(data))
 
 
@@ -134,21 +139,3 @@ def serialize(data) -> bytes:
     _serialize(to, data)
     to.seek(0)
     return to.read()
-
-"""
-x = serialize(a := {
-    "asd": {
-        1: [2, (3, 6, {7: "99"})],
-        "ci": {
-            "add": Decimal('123.123232'),
-            "radd": Decimal('987897798789.98789798778')
-        }
-    },
-    'a': Decimal('0.9999995983475439783689275693465392875692384756')
-})
-
-print(x.hex())
-print(deserialize(x))
-
-print(a == deserialize(x))
-"""
