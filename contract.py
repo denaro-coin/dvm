@@ -9,6 +9,7 @@ from denaro.transactions import TransactionOutput
 from dvm.serializer import serialize, deserialize
 
 CURRENT_VERSION = b"dvm0\0"
+CONTRACT_METHOD_TIMEOUT = 0.01
 
 
 class Address:
@@ -41,16 +42,22 @@ class DVMTransaction:
     def __init__(self, tx_hash: str, outputs: List[TransactionOutput]):
         self.tx_hash = tx_hash
         self.outputs = outputs
-        
+
+
+class Block(dict):
+    ...
+
 
 class ContractsCache:
     # fixme
     contracts: Dict[str, "Contract"] = {}
+    contracts_backup: Dict[str, "Contract"] = {}
     contract_instances: list = []
     current_contract_hash: str = None
 
     current_transaction: DVMTransaction = None
-    #current_block: Block = None
+    current_block: "Block" = None
+    additional_gas: int = 0
 
     emitted_events: List[Tuple[str, Event]] = []
     created_contracts: List[tuple] = []
@@ -83,7 +90,7 @@ class Contract:
     @staticmethod
     def deploy(obj):
         assert Contract.deployed is None, 'cannot deploy: already deployed'
-        assert issubclass(obj, Contract), 'cannot deploy: contract does not inherit main class'
+        assert issubclass(obj, Contract), 'cannot deploy: contract does not inherit from main class'
         Contract.deployed = obj
         return obj
 
@@ -97,7 +104,7 @@ class Contract:
 
             'address': self._contract_hash,
             'transaction': ContractsCache.current_transaction,
-            #'block': ContractsCache.current_block
+            'block': ContractsCache.current_block
         }
 
     # todo
@@ -114,7 +121,7 @@ class Contract:
         if func.__code__.co_argcount - 1 > len(func.__annotations__):
             raise TypeError(f'Method {func.__name__} types must be specified')
 
-        def wrapper(*args, **kwargs):
+        def do_checks(args, kwargs):
             func_args = inspect.getfullargspec(func).args[1:]
             if func_args and func_args[0] == 'sender':
                 if args[0].__class__ != Address:
@@ -139,16 +146,32 @@ class Contract:
                     kwargs[key] = int(arg)
                 elif type(arg) != should_be:
                     raise TypeError(f'Parameter {i + 1} of {func.__name__} method must be {should_be.__name__}, not {type(arg).__name__}')
+            return args, kwargs
 
-            try:
-                previous_contract = ContractsCache.current_contract_hash
-                ContractsCache.current_contract_hash = self._contract_hash
-                res = func(*args, **kwargs)
-                ContractsCache.current_contract_hash = previous_contract
-                return res
-            except Exception:
-                print('caught in ', self._contract_hash, args)
-                raise
+        if inspect.iscoroutinefunction(func):
+            async def wrapper(*args, **kwargs):
+                args, kwargs = do_checks(args, kwargs)
+                try:
+                    previous_contract = ContractsCache.current_contract_hash
+                    ContractsCache.current_contract_hash = self._contract_hash
+                    res = await func(*args, **kwargs)
+                    ContractsCache.current_contract_hash = previous_contract
+                    return res
+                except Exception:
+                    print('caught in ', self._contract_hash, args)
+                    raise
+        else:
+            def wrapper(*args, **kwargs):
+                args, kwargs = do_checks(args, kwargs)
+                try:
+                    previous_contract = ContractsCache.current_contract_hash
+                    ContractsCache.current_contract_hash = self._contract_hash
+                    res = func(*args, **kwargs)
+                    ContractsCache.current_contract_hash = previous_contract
+                    return res
+                except Exception:
+                    print('caught in ', self._contract_hash, args)
+                    raise
         self._methods[func.__name__] = wrapper
 
     def __getattr__(self, key: str):

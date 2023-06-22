@@ -1,4 +1,4 @@
-from asyncio import sleep, get_event_loop
+from asyncio import sleep, new_event_loop
 from copy import deepcopy
 from decimal import Decimal
 from os import environ
@@ -8,14 +8,12 @@ from denaro.constants import SMALLEST
 from denaro.helpers import sha256, point_to_string
 from denaro.transactions import CoinbaseTransaction, Transaction
 
-from dvm.contract import ContractCallList, ContractCall, ContractCreation, ContractsCache, Address
-from dvm.vm import DVM
+from dvm.contract import ContractCallList, ContractCall, ContractCreation, ContractsCache, Address, Block, CONTRACT_METHOD_TIMEOUT
+from dvm.vm import DVM, contract_globals
 from dvm.serializer import serialize
 from dvm.timeout import timeout
 
 from dvm.contract import DVMTransaction
-
-CONTRACT_METHOD_TIMEOUT = 0.01
 
 Database.credentials = {
     'user': environ.get('DENARO_DATABASE_USER', 'denaro'),
@@ -30,13 +28,13 @@ DVM_ADDRESS = 'DsmArTjpJNuEBuHB2x4f14cDifdduTtu2CR1BMs1P5RcF'
 async def main():
     denaro_database: Database = await Database.get()
     dvm = DVM(denaro_database)
-    i = 100_000
+    contract_globals['get_block'] = dvm.get_block
     async with denaro_database.pool.acquire() as connection:
         res = await connection.fetchrow('SELECT block_no FROM dvm_state ORDER BY block_no DESC LIMIT 1')
         if res:
             i = res['block_no'] + 1
-    #i = 18046 - 1
-    i = await denaro_database.get_next_block_id()
+    #i = 23966 - 1
+    #i = await denaro_database.get_next_block_id()
     while True:
         block = await denaro_database.get_block_by_id(i)
         if block is not None:
@@ -85,22 +83,24 @@ async def main():
             if not calls:
                 continue
             contracts_hashes = [contract_call.contract_hash for contract_call in [call['contract_call'] for call in calls] if contract_call.__class__ == ContractCall]
-            #contracts_hashes.extend(['ce6dcfede06637a498554c1e5003857d7014b0cb26ea63c6d05e62d13c2ecb25', 'eeb0528554404d4a821018a6153644206a9ccf92c622421167126a02d960e8d7'])
             ContractsCache.contracts = await dvm.get_contracts(contracts_hashes)
+            ContractsCache.current_block = Block(block)
 
             dvm_transactions = []
             emitted_events = []
             for call in calls:
                 contract_call, tx_hash, output_index, sender = call['contract_call'], call['tx_hash'], call['output_index'], call['sender']
 
-                state_backup = deepcopy(ContractsCache.contracts)
+                ContractsCache.contracts_backup = deepcopy(ContractsCache.contracts)
+                state_backup = ContractsCache.contracts_backup
                 ContractsCache.current_transaction = call['dvm_tx']
+                ContractsCache.additional_gas = 0
                 ContractsCache.emitted_events = []
                 ContractsCache.created_contracts = []
 
                 if isinstance(contract_call, ContractCreation):
                     if contract := await dvm.create_contract(contract_call, call['contract_creation_hash'], tx_hash, block['id'], sender, contract_call.args):
-                        pass
+                        ContractsCache.additional_gas = len(contract_call.source_code)
                     else:
                         continue
                 else:
@@ -117,7 +117,7 @@ async def main():
                         print(f'Skipping call because contract {contract_call.contract_hash} does not have {contract_call.method} method')
                         continue
                     try:
-                        timeout(CONTRACT_METHOD_TIMEOUT, contract._methods[contract_call.method], Address(sender), *contract_call.args)
+                        await timeout(CONTRACT_METHOD_TIMEOUT, contract._methods[contract_call.method], Address(sender), *contract_call.args)
                     except (Exception, KeyboardInterrupt) as e:
                         ContractsCache.contracts = state_backup
                         print(f'Transaction in contract {contract_call.contract_hash} reverted because of {e.__class__.__name__}: {str(e)}')
@@ -149,7 +149,9 @@ async def main():
                     state_size_delta += len(serialize([event.to_dict() for _, event in ContractsCache.emitted_events]))
                     print(len(serialize([event.to_dict() for _, event in ContractsCache.emitted_events])), 'bytes for events')
 
-                total_gas = state_size_delta + len(ContractsCache.contract_instances) * 1024
+                print(ContractsCache.additional_gas, 'additional_gas')
+                total_gas = state_size_delta + len(ContractsCache.contract_instances) * 1024 + ContractsCache.additional_gas
+                print(total_gas, 'total gas')
                 fees_required = total_gas * call['fee_rate']
 
                 if call['fees'] < fees_required:
@@ -173,4 +175,4 @@ async def main():
             await sleep(3)
 
 if __name__ == '__main__':
-    get_event_loop().run_until_complete(main())
+    new_event_loop().run_until_complete(main())

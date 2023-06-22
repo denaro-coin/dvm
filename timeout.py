@@ -22,6 +22,7 @@ SOFTWARE.
 """
 
 import threading
+from inspect import iscoroutinefunction
 
 try:
     import thread
@@ -37,11 +38,14 @@ def timeout_handler() -> None:
     raise ContractTimeoutException()
 
 
-def timeout(s, func, *args, **kwargs):
+async def timeout(s, func, *args, **kwargs):
     timer = threading.Timer(s, thread.interrupt_main)
     timer.start()
     try:
-        result = func(*args, **kwargs)
+        if iscoroutinefunction(func):
+            result = await func(*args, **kwargs)
+        else:
+            result = func(*args, **kwargs)
     finally:
         timer.cancel()
     return result

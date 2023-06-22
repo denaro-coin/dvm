@@ -1,22 +1,34 @@
 import json
 import zlib
+from copy import deepcopy
 from decimal import Decimal
 
-from RestrictedPython import compile_restricted, safe_builtins
+from RestrictedPython import compile_restricted, safe_builtins, RestrictingNodeTransformer
 from RestrictedPython.Eval import default_guarded_getiter, default_guarded_getitem
-from RestrictedPython.Guards import guarded_iter_unpack_sequence, guarded_unpack_sequence
+from RestrictedPython.Guards import guarded_iter_unpack_sequence, guarded_unpack_sequence, full_write_guard
 from denaro import Database
 
-from dvm.contract import ContractCreation, Contract, LimitedContract, Address, Event, ContractsCache
+from dvm.contract import ContractCreation, Contract, LimitedContract, Address, Event, ContractsCache, \
+    CONTRACT_METHOD_TIMEOUT
 from dvm.serializer import deserialize
+from dvm.timeout import timeout
 
 
 def _write_(obj):
     if isinstance(obj, Contract) and obj.__class__ != LimitedContract:
         return obj
-    if obj.__class__ in (dict, list):
+    if type(obj) in (dict, list):
         return obj
     raise Exception(f'Cannot write to {obj.__class__.__name__}')
+
+
+def _inplacevar_(op: str, value, arg):
+    if op == '+=':
+        return value + arg
+    elif op == '-=':
+        return value - arg
+    else:
+        raise NotImplementedError(f'Operator {op} not implemented')
 
 
 class NonOverridable(type):
@@ -26,12 +38,16 @@ class NonOverridable(type):
         return type.__new__(mcs, name, bases, dct)
 
 
-def load_contract(contract_hash: str):
+async def load_contract(contract_hash: str):
+    if contract_hash not in ContractsCache.contracts:
+        contract = (await DVM.instance.get_contracts([contract_hash]))[contract_hash]
+        ContractsCache.contracts[contract_hash] = contract
+        ContractsCache.contracts_backup[contract_hash] = deepcopy(contract)
     return LimitedContract(contract_hash)
 
 
 contract_globals = safe_builtins | {
-    'Decimal': Decimal, '_write_': _write_,
+    'Decimal': Decimal, '_write_': _write_, '_inplacevar_': _inplacevar_,
     'Contract': Contract, 'load_contract': load_contract,
     'Event': Event,
     '__metaclass__': NonOverridable, '__name__': 'dvm_contract',
@@ -42,13 +58,26 @@ contract_globals = safe_builtins | {
 }
 
 
+class DVMNodeTransformer(RestrictingNodeTransformer):
+    def visit_AsyncFunctionDef(self, node):
+        """Allow async functions."""
+        return self.node_contents_visit(node)
+
+    def visit_Await(self, node):
+        """Allow async functionality."""
+        return self.node_contents_visit(node)
+
+
 class DVM:
+    instance: "DVM" = None
+
     def __init__(self, database: Database):
         self.database = database
+        DVM.instance = self
 
     async def create_contract(self, contract_creation: ContractCreation, contract_hash: str, tx_hash: str, block_no: int, sender: str, args, kwargs={}):
         try:
-            bytecode = compile_restricted(contract_creation.source_code, f'Contract <{contract_hash}>', 'exec')
+            bytecode = compile_restricted(contract_creation.source_code, f'Contract <{contract_hash}>', policy=DVMNodeTransformer)
             exec(bytecode, contract_globals, {})
             contract = Contract.deployed(contract_hash, {})
             Contract.deployed = None
@@ -60,7 +89,7 @@ class DVM:
             ContractsCache.current_contract_hash = contract_hash
             ContractsCache.contract_instances = [contract_hash]
             try:
-                contract.constructor(Address(sender), *args, **kwargs)
+                await timeout(CONTRACT_METHOD_TIMEOUT, contract._methods['constructor'], Address(sender), *args, **kwargs)
             except Exception as e:
                 print(f'Contract has not been deployed because of a {e.__class__.__name__}: {str(e)} exception occurred while executing constructor')
                 return False
@@ -94,7 +123,7 @@ class DVM:
         for res in res:
             contract_hash, source_code = res
             source_code = zlib.decompress(source_code).decode()
-            bytecode = compile_restricted(source_code, f'Contract <{contract_hash}>', 'exec')
+            bytecode = compile_restricted(source_code, f'Contract <{contract_hash}>', policy=DVMNodeTransformer)
             try:
                 exec(bytecode, contract_globals, {})
                 contract = Contract.deployed(contract_hash, contracts_states[contract_hash])
@@ -145,3 +174,12 @@ class DVM:
         if method in contract._variables:
             return contract._variables[method]
         return contract._methods[method](*args)
+
+    # contract VM methods
+
+    async def get_block(self, block_no_or_block_hash: str | int):
+        ContractsCache.additional_gas += 512
+        block = await (self.database.get_block(block_no_or_block_hash) if isinstance(block_no_or_block_hash, str) else self.database.get_block_by_id(block_no_or_block_hash))
+        if not block:
+            raise Exception(f'Block {block_no_or_block_hash} not found')
+        return block
